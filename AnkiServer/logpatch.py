@@ -1,23 +1,25 @@
-
+# -*- mode: python ; coding: utf-8 -*-
+#
 # AnkiServer - A personal Anki sync server
 # Copyright (C) 2013 David Snopek
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from email.utils import formatdate
 import logging
-import logging.handlers
-import types
+import smtplib
+
 
 # The SMTPHandler taken from python 2.6
 class SMTPHandler(logging.Handler):
@@ -35,16 +37,19 @@ class SMTPHandler(logging.Handler):
         for the credentials argument.
         """
         logging.Handler.__init__(self)
-        if type(mailhost) == types.TupleType:
+        # if type(mailhost) == types.TupleType:
+        if isinstance(mailhost, tuple):  # suggested by flake8
             self.mailhost, self.mailport = mailhost
         else:
             self.mailhost, self.mailport = mailhost, None
-        if type(credentials) == types.TupleType:
+        # if type(credentials) == types.TupleType:
+        if isinstance(credentials, tuple):
             self.username, self.password = credentials
         else:
             self.username = None
         self.fromaddr = fromaddr
-        if type(toaddrs) == types.StringType:
+        # if isinstance(toaddrs, (str, unicode)):
+        if isinstance(toaddrs, (str, )):
             toaddrs = [toaddrs]
         self.toaddrs = toaddrs
         self.subject = subject
@@ -64,18 +69,6 @@ class SMTPHandler(logging.Handler):
                  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
                  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
-    def date_time(self):
-        """
-        Return the current date and time formatted for a MIME header.
-        Needed for Python 1.5.2 (no email package available)
-        """
-        year, month, day, hh, mm, ss, wd, y, z = time.gmtime(time.time())
-        s = "%s, %02d %3s %4d %02d:%02d:%02d GMT" % (
-                self.weekdayname[wd],
-                day, self.monthname[month], year,
-                hh, mm, ss)
-        return s
-
     def emit(self, record):
         """
         Emit a record.
@@ -83,21 +76,14 @@ class SMTPHandler(logging.Handler):
         Format the record and send it to the specified addressees.
         """
         try:
-            import smtplib
-            try:
-                from email.utils import formatdate
-            except ImportError:
-                formatdate = self.date_time
             port = self.mailport
             if not port:
                 port = smtplib.SMTP_PORT
             smtp = smtplib.SMTP(self.mailhost, port)
             msg = self.format(record)
             msg = "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\n\r\n%s" % (
-                            self.fromaddr,
-                            string.join(self.toaddrs, ","),
-                            self.getSubject(record),
-                            formatdate(), msg)
+                self.fromaddr, ",".join(self.toaddrs),
+                self.getSubject(record), formatdate(), msg)
             if self.username:
                 smtp.login(self.username, self.password)
             smtp.sendmail(self.fromaddr, self.toaddrs, msg)
@@ -107,6 +93,6 @@ class SMTPHandler(logging.Handler):
         except:
             self.handleError(record)
 
+
 # Monkey patch logging.handlers
 logging.handlers.SMTPHandler = SMTPHandler
-

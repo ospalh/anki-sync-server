@@ -1,36 +1,41 @@
-
+# -*- mode: python ; coding: utf-8 -*-
+#
 # AnkiServer - A personal Anki sync server
 # Copyright (C) 2013 David Snopek
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import errno
+import os
 
 import anki
 import anki.storage
 
-import os, errno
 
 __all__ = ['CollectionWrapper', 'CollectionManager']
+
 
 class CollectionWrapper(object):
     """A simple wrapper around an anki.storage.Collection object.
 
-    This allows us to manage and refer to the collection, whether it's open or not. It
-    also provides a special "continuation passing" interface for executing functions
-    on the collection, which makes it easy to switch to a threading mode.
-    
-    See ThreadingCollectionWrapper for a version that maintains a seperate thread for
-    interacting with the collection.
+    This allows us to manage and refer to the collection, whether it's
+    open or not. It also provides a special "continuation passing"
+    interface for executing functions on the collection, which makes
+    it easy to switch to a threading mode.
+
+    See ThreadingCollectionWrapper for a version that maintains a
+    seperate thread for interacting with the collection.
     """
 
     def __init__(self, path, setup_new_collection=None):
@@ -43,9 +48,12 @@ class CollectionWrapper(object):
         self.close()
 
     def execute(self, func, args=[], kw={}, waitForReturn=True):
-        """ Executes the given function with the underlying anki.storage.Collection
-        object as the first argument and any additional arguments specified by *args
-        and **kw.
+        """
+        Execute a function.
+
+        Executes the given function with the underlying
+        anki.storage.Collection object as the first argument and any
+        additional arguments specified by *args and **kw.
 
         If 'waitForReturn' is True, then it will block until the function has
         executed and return its return value.  If False, the function MAY be
@@ -92,8 +100,8 @@ class CollectionWrapper(object):
                 self.__col = self.__create_collection()
 
         # If for some reason the underlying Collection is closed, then
-        # we attempt to re-open it! (this probably shouldn't happen, but
-        # I'm seeing it in production...)
+        # we attempt to re-open it! (this probably shouldn't happen,
+        # but I'm seeing it in production...)
         if not self.__col.db:
             self.__col.reopen()
 
@@ -108,6 +116,7 @@ class CollectionWrapper(object):
     def opened(self):
         """Returns True if the collection is open, False otherwise."""
         return self.__col is not None
+
 
 class CollectionManager(object):
     """Manages a set of CollectionWrapper objects."""
@@ -125,7 +134,8 @@ class CollectionManager(object):
         try:
             col = self.collections[path]
         except KeyError:
-            col = self.collections[path] = self.collection_wrapper(path, setup_new_collection)
+            col = self.collections[path] = self.collection_wrapper(
+                path, setup_new_collection)
 
         return col
 
@@ -134,4 +144,3 @@ class CollectionManager(object):
         for path, col in self.collections.items():
             del self.collections[path]
             col.close()
-

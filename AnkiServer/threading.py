@@ -1,37 +1,41 @@
-
+# -*- mode: python ; coding: utf-8 -*-
+#
 # AnkiServer - A personal Anki sync server
 # Copyright (C) 2013 David Snopek
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from __future__ import absolute_import
+# from __future__ import absolute_import
 
-import anki
-import anki.storage
-
-from AnkiServer.collection import CollectionWrapper, CollectionManager
-
-from threading import Thread
 from Queue import Queue
+from threading import Thread
+import logging
+import time
 
-import time, logging
+from .collection import CollectionWrapper, CollectionManager
+
 
 __all__ = ['ThreadingCollectionWrapper', 'ThreadingCollectionManager']
 
+
 class ThreadingCollectionWrapper(object):
-    """Provides the same interface as CollectionWrapper, but it creates a new Thread to 
-    interact with the collection."""
+    """
+    Threaded replacement for CollectionWrapper.
+
+    Provides the same interface as CollectionWrapper, but it creates a
+    new Thread to interact with the collection.
+    """
 
     def __init__(self, path, setup_new_collection=None):
         self.path = path
@@ -56,11 +60,13 @@ class ThreadingCollectionWrapper(object):
         return current_thread() == self._thread
 
     def execute(self, func, args=[], kw={}, waitForReturn=True):
-        """ Executes a given function on this thread with the *args and **kw.
+        """
+        Executes a given function on this thread with *args and **kw.
 
-        If 'waitForReturn' is True, then it will block until the function has
-        executed and return its return value.  If False, it will return None
-        immediately and the function will be executed sometime later.
+        If 'waitForReturn' is True, then it will block until the
+        function has executed and return its return value.  If False,
+        it will return None immediately and the function will be
+        executed sometime later.
         """
 
         if waitForReturn:
@@ -88,21 +94,28 @@ class ThreadingCollectionWrapper(object):
                 else:
                     func_name = func.__class__.__name__
 
-                logging.info('CollectionThread[%s]: Running %s(*%s, **%s)', self.path, func_name, repr(args), repr(kw))
+                logging.info(
+                    'CollectionThread[%s]: Running %s(*%s, **%s)',
+                    self.path, func_name, repr(args), repr(kw))
                 self.last_timestamp = time.time()
 
                 try:
                     ret = self.wrapper.execute(func, args, kw, return_queue)
                 except Exception, e:
-                    logging.error('CollectionThread[%s]: Unable to %s(*%s, **%s): %s',
-                        self.path, func_name, repr(args), repr(kw), e, exc_info=True)
-                    # we return the Exception which will be raise'd on the other end
+                    logging.error(
+                        'CollectionThread[%s]: Unable to %s(*%s, **%s): %s',
+                        self.path, func_name, repr(args), repr(kw), e,
+                        exc_info=True)
+                    # we return the Exception which will be raise'd on
+                    # the other end
                     ret = e
 
                 if return_queue is not None:
                     return_queue.put(ret)
         except Exception, e:
-            logging.error('CollectionThread[%s]: Thread crashed! Exception: %s', self.path, e, exc_info=True)
+            logging.error(
+                'CollectionThread[%s]: Thread crashed! Exception: %s',
+                self.path, e, exc_info=True)
         finally:
             self.wrapper.close()
             # clean out old thread object
@@ -148,6 +161,7 @@ class ThreadingCollectionWrapper(object):
     def opened(self):
         return self.wrapper.opened()
 
+
 class ThreadingCollectionManager(CollectionManager):
     """Manages a set of ThreadingCollectionWrapper objects."""
 
@@ -164,20 +178,31 @@ class ThreadingCollectionManager(CollectionManager):
         monitor.start()
         self._monitor_thread = monitor
 
-    # TODO: we should raise some error if a collection is started on a manager that has already been shutdown!
-    #       or maybe we could support being restarted?
-
-    # TODO: it would be awesome to have a safe way to stop inactive threads completely!
-    # TODO: we need a way to inform other code that the collection has been closed
+    # TODO: we should raise some error if a collection is started on a
+    #       manager that has already been shutdown!  or maybe we could
+    #       support being restarted?
+    # TODO: it would be awesome to have a safe way to stop inactive
+    #       threads completely!
+    # TODO: we need a way to inform other code that the collection has
+    #       been closed
     def _monitor_run(self):
-        """ Monitors threads for inactivity and closes the collection on them
-        (leaves the thread itself running -- hopefully waiting peacefully with only a
-        small memory footprint!) """
+        """
+        Monitor threads for inactivity.
+
+        Monitor threads for inactivity and closes the collection on
+        them (leaves the thread itself running -- hopefully waiting
+        peacefully with only a small memory footprint!)
+        """
         while True:
             cur = time.time()
             for path, thread in self.collections.items():
-                if thread.running and thread.wrapper.opened() and thread.qempty() and cur - thread.last_timestamp >= self.monitor_inactivity:
-                    logging.info('Monitor is closing collection on inactive CollectionThread[%s]', thread.path)
+                if thread.running and thread.wrapper.opened() \
+                        and thread.qempty() \
+                        and cur - thread.last_timestamp \
+                        >= self.monitor_inactivity:
+                    logging.info(
+                        'Monitor is closing collection on inactive '
+                        'CollectionThread[%s]', thread.path)
                     thread.close()
             time.sleep(self.monitor_frequency)
 
@@ -198,6 +223,7 @@ class ThreadingCollectionManager(CollectionManager):
 
 collection_manager = None
 
+
 def getCollectionManager():
     """Return the global ThreadingCollectionManager for this process."""
     global collection_manager
@@ -205,10 +231,10 @@ def getCollectionManager():
         collection_manager = ThreadingCollectionManager()
     return collection_manager
 
+
 def shutdown():
     """If the global ThreadingCollectionManager exists, shut it down."""
     global collection_manager
     if collection_manager is not None:
         collection_manager.shutdown()
         collection_manager = None
-

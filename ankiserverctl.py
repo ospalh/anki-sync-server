@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- mode: python ; coding: utf-8 -*-
 
 import os
 import sys
@@ -14,6 +15,7 @@ AUTHDBPATH = "auth.db"
 PIDPATH = "/tmp/ankiserver.pid"
 COLLECTIONPATH = "collections/"
 
+
 def usage():
     print "usage: "+sys.argv[0]+" <command> [<args>]"
     print
@@ -24,6 +26,7 @@ def usage():
     print "  deluser <username> - delete a user"
     print "  lsuser             - list users"
     print "  passwd <username>  - change password of a user"
+
 
 def startsrv(configpath):
     if not configpath:
@@ -38,12 +41,12 @@ def startsrv(configpath):
 
     devnull = open(os.devnull, "w")
 
-    pid = subprocess.Popen( ["paster", "serve", configpath],
-                            stdout=devnull,
-                            stderr=devnull).pid
+    pid = subprocess.Popen(
+        ["paster", "serve", configpath], stdout=devnull, stderr=devnull).pid
 
     with open(PIDPATH, "w") as pidfile:
         pidfile.write(str(pid))
+
 
 def stopsrv():
     if os.path.isfile(PIDPATH):
@@ -54,9 +57,11 @@ def stopsrv():
                 os.kill(pid, signal.SIGKILL)
                 os.remove(PIDPATH)
         except Exception, error:
-            print >>sys.stderr, sys.argv[0]+": Failed to stop server: "+error.message
+            print >>sys.stderr, \
+                sys.argv[0]+": Failed to stop server: "+error.message
     else:
         print >>sys.stderr, sys.argv[0]+": The server is not running"
+
 
 def adduser(username):
     if username:
@@ -69,8 +74,8 @@ def adduser(username):
         conn = sqlite3.connect(AUTHDBPATH)
         cursor = conn.cursor()
 
-        cursor.execute( "CREATE TABLE IF NOT EXISTS auth "
-                        "(user VARCHAR PRIMARY KEY, hash VARCHAR)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS auth "
+                       "(user VARCHAR PRIMARY KEY, hash VARCHAR)")
 
         cursor.execute("INSERT INTO auth VALUES (?, ?)", (username, hash))
 
@@ -81,6 +86,7 @@ def adduser(username):
         conn.close()
     else:
         usage()
+
 
 def deluser(username):
     if username and os.path.isfile(AUTHDBPATH):
@@ -96,6 +102,7 @@ def deluser(username):
     else:
         print >>sys.stderr, sys.argv[0]+": Database file does not exist"
 
+
 def lsuser():
     conn = sqlite3.connect(AUTHDBPATH)
     cursor = conn.cursor()
@@ -110,6 +117,7 @@ def lsuser():
         row = cursor.fetchone()
 
     conn.close()
+
 
 def passwd(username):
     if os.path.isfile(AUTHDBPATH):
@@ -128,6 +136,7 @@ def passwd(username):
         conn.close()
     else:
         print >>sys.stderr, sys.argv[0]+": Database file does not exist"
+
 
 def main():
     argc = len(sys.argv)
@@ -157,6 +166,7 @@ def main():
             exitcode = 1
 
     sys.exit(exitcode)
+
 
 if __name__ == "__main__":
     main()
