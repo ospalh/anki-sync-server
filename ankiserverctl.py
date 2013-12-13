@@ -1,6 +1,12 @@
 #!/usr/bin/env python
 # -*- mode: python ; coding: utf-8 -*-
 
+"""
+Controller for the Anki Sync Server.
+"""
+
+from __future__ import print_function
+
 import os
 import sys
 import signal
@@ -17,15 +23,18 @@ COLLECTIONPATH = "collections/"
 
 
 def usage():
-    print "usage: "+sys.argv[0]+" <command> [<args>]"
-    print
-    print "Commands:"
-    print "  start [configfile] - start the server"
-    print "  stop               - stop the server"
-    print "  adduser <username> - add a new user"
-    print "  deluser <username> - delete a user"
-    print "  lsuser             - list users"
-    print "  passwd <username>  - change password of a user"
+    print(u"""\
+usage: {} <command> [<args>]
+
+
+Commands:
+  start [configfile] - start the server
+  stop               - stop the server
+  adduser <username> - add a new user
+  deluser <username> - delete a user
+  lsuser             - list users
+  passwd <username>  - change password of a user
+""".format(sys.argv[0]))
 
 
 def startsrv(configpath):
@@ -65,7 +74,7 @@ def stopsrv():
 
 def adduser(username):
     if username:
-        print "Enter password for "+username+": "
+        print("Enter password for {}: ".format(username))
 
         password = getpass.getpass()
         salt = binascii.b2a_hex(os.urandom(8))
@@ -100,7 +109,8 @@ def deluser(username):
     elif not username:
         usage()
     else:
-        print >>sys.stderr, sys.argv[0]+": Database file does not exist"
+        print ("{}: Database file does not exist".format(sys.argv[0]),
+               file=sys.stderr)
 
 
 def lsuser():
@@ -112,16 +122,14 @@ def lsuser():
     row = cursor.fetchone()
 
     while row is not None:
-        print row[0]
-
+        print(row[0])
         row = cursor.fetchone()
-
     conn.close()
 
 
 def passwd(username):
     if os.path.isfile(AUTHDBPATH):
-        print "Enter password for "+username+": "
+        print("Enter password for "+username+": ")
 
         password = getpass.getpass()
         salt = binascii.b2a_hex(os.urandom(8))
@@ -135,7 +143,8 @@ def passwd(username):
         conn.commit()
         conn.close()
     else:
-        print >>sys.stderr, sys.argv[0]+": Database file does not exist"
+        print("{}: Database file does not exist".format(sys.argv[0]),
+               file=sys.stderr)
 
 
 def main():
