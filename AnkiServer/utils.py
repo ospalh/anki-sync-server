@@ -16,20 +16,12 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import logging
 
 def setup_logging(config_file=None):
     """Setup logging based on a config_file."""
-
-    import logging
-
     if config_file is not None:
-        # monkey patch the logging.config.SMTPHandler if necessary
-        import sys
-        if sys.version_info[0] == 2 and sys.version_info[1] == 5:
-            import AnkiServer.logpatch
-
         # load the config file
-        import logging.config
-        logging.config.fileConfig(config_file)
+         logging.config.fileConfig(config_file)
     else:
         logging.getLogger().setLevel(logging.INFO)

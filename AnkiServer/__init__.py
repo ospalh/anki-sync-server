@@ -16,8 +16,19 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from distutils.version import StrictVersion
 import sys
 import os.path
+
+sys_strict_version = StrictVersion('{}.{}.{}'.format(
+        sys.version_info.major,
+        sys.version_info.minor,
+        sys.version_info.micro))
+if sys_strict_version < StrictVersion('2.6'):
+    raise Exception("Please upgrade your Python to 2.6 or 2.7")
+if sys_strict_version >= StrictVersion('3.0'):
+    raise Exception("AnkiServer does not work with Python 3")
+
 # We put the system installed Anki first!
 sys.path.insert(0, "/usr/share/anki")
 # We'll put our bundled Anki after it
