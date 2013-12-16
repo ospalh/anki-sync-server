@@ -347,10 +347,8 @@ class SyncApp(object):
             self.collection_manager = getCollectionManager()
 
         # make sure the base_url has a trailing slash
-        if len(self.base_url) == 0:
-            self.base_url = '/'
-        elif self.base_url[-1] != '/':
-            self.base_url = base_url + '/'
+        if not self.base_url.endswith('/'):
+            self.base_url += '/'
 
     def generateHostKey(self, username):
         """
@@ -682,7 +680,6 @@ def main():
         print "Exiting ..."
     finally:
         shutdown()
-
 
 if __name__ == '__main__':
     main()
