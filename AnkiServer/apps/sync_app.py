@@ -1,30 +1,37 @@
-
+# -*- mode: python ; coding: utf-8 -*-
+#
 # AnkiServer - A personal Anki sync server
 # Copyright (C) 2013 David Snopek
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from webob.dec import wsgify
-from webob.exc import *
 from webob import Response
-
-import os
+from webob.dec import wsgify
+from webob.exc import HTTPBadRequest, HTTPForbidden, HTTPInternalServerError, \
+    HTTPNotFound
+from wsgiref.simple_server import make_server
 import hashlib
+import logging
+import os
+import random
+import string
+import time
+import zipfile
+import zlib
 
-import AnkiServer
+from ..threading import getCollectionManager, shutdown
 
-import anki
 from anki.sync import Syncer, MediaSyncer
 from anki.utils import intTime, checksum
 from anki.consts import SYNC_ZIP_SIZE, SYNC_ZIP_COUNT
@@ -44,8 +51,16 @@ try:
 except ImportError:
     from sqlite3 import dbapi2 as sqlite
 
+
 class SyncCollectionHandler(Syncer):
-    operations = ['meta', 'applyChanges', 'start', 'chunk', 'applyChunk', 'sanityCheck2', 'finish']
+    operations = [
+        'meta',
+        'applyChanges',
+        'start',
+        'chunk',
+        'applyChunk',
+        'sanityCheck2',
+        'finish']
 
     def __init__(self, col):
         # So that 'server' (the 3rd argument) can't get set
@@ -57,27 +72,28 @@ class SyncCollectionHandler(Syncer):
             self.col.media.connect()
 
         if cv is not None:
-            client, version, platform = cv.split(',')
+            client, version, dummy_platform = cv.split(',')
         else:
             client = 'ankidesktop'
             version = '2.0.12'
-            platform = 'unknown'
 
-        version_int = [int(x) for x in version.split('.')] 
+        version_int = [int(x) for x in version.split('.')]
 
         # Some insanity added in Anki 2.0.13
-        if client == 'ankidesktop' and version_int[0] >= 2 and version_int[1] >= 0 and version_int[2] >= 13:
+        if client == 'ankidesktop' and version_int[0] >= 2 and \
+                version_int[1] >= 0 and version_int[2] >= 13:
             return {
-              'scm': self.col.scm,
-              'ts': intTime(),
-              'mod': self.col.mod,
-              'usn': self.col._usn,
-              'musn': self.col.media.usn(),
-              'msg': '',
-              'cont': True,
-            }
+                'scm': self.col.scm,
+                'ts': intTime(),
+                'mod': self.col.mod,
+                'usn': self.col._usn,
+                'musn': self.col.media.usn(),
+                'msg': '',
+                'cont': True}
         else:
-            return (self.col.mod, self.col.scm, self.col._usn, intTime(), self.col.media.usn())
+            return (self.col.mod, self.col.scm, self.col._usn, intTime(),
+                    self.col.media.usn())
+
 
 class SyncMediaHandler(MediaSyncer):
     operations = ['remove', 'files', 'addFiles', 'mediaSanity', 'mediaList']
@@ -92,23 +108,28 @@ class SyncMediaHandler(MediaSyncer):
         return rrem
 
     def files(self, minUsn=0, need=None):
-        """Gets files from the media database and returns them as ZIP file data."""
+        """
+        Returns files as ZIP file data.
 
-        import zipfile
+        Gets files from the media database and returns them as ZIP file data.
+        """
 
-        # The client can pass None - I'm not sure what the correct action is in that case,
-        # for now, we're going to resync everything.
+        # The client can pass None - I'm not sure what the correct
+        # action is in that case, for now, we're going to resync
+        # everything.
         if need is None:
             need = self.mediaList()
 
-        # Comparing minUsn to need, we attempt to determine which files have already
-        # been sent, and we remove them from the front of the list.
+        # Comparing minUsn to need, we attempt to determine which
+        # files have already been sent, and we remove them from the
+        # front of the list.
         need = need[len(need) - (self.col.media.usn() - minUsn):]
 
-        # Copied and modified from anki.media.MediaManager.zipAdded(). Instead of going
-        # over the log, we loop over the files needed and increment the USN along the
-        # way. The zip also has an additional '_usn' member, which the client uses to
-        # update the usn on their end.
+        # Copied and modified from
+        # anki.media.MediaManager.zipAdded(). Instead of going over
+        # the log, we loop over the files needed and increment the USN
+        # along the way. The zip also has an additional '_usn' member,
+        # which the client uses to update the usn on their end.
 
         f = StringIO()
         z = zipfile.ZipFile(f, "w", compression=zipfile.ZIP_DEFLATED)
@@ -136,17 +157,16 @@ class SyncMediaHandler(MediaSyncer):
 
     def addFiles(self, data):
         """Adds files based from ZIP file data and returns the usn."""
-
-        import zipfile
-
-        # The argument name is 'zip' on MediaSyncer, but we always use 'data' when
-        # we receive non-JSON data. We have to override to receive the right argument!
-        #MediaSyncer.addFiles(self, zip=fd.getvalue())
+        # The argument name is 'zip' on MediaSyncer, but we always use
+        # 'data' when we receive non-JSON data. We have to override to
+        # receive the right argument!  MediaSyncer.addFiles(self,
+        # zip=fd.getvalue())
 
         usn = self.col.media.usn()
 
-        # Copied from anki.media.MediaManager.syncAdd(). Modified to not need the
-        # _usn file and, instead, to increment the server usn with each file added.
+        # Copied from anki.media.MediaManager.syncAdd(). Modified to
+        # not need the _usn file and, instead, to increment the server
+        # usn with each file added.
 
         f = StringIO(data)
         z = zipfile.ZipFile(f, "r")
@@ -173,39 +193,51 @@ class SyncMediaHandler(MediaSyncer):
                 csum = checksum(data)
                 name = meta[i.filename]
                 # can we store the file on this system?
-                # TODO: this function changed it's name in Anki 2.0.12 to media.hasIllegal()
+                # TODO: this function changed it's name in Anki 2.0.12
+                #       to media.hasIllegal()
                 if self.col.media.illegal(name):
                     continue
                 # save file
-                open(os.path.join(self.col.media.dir(), name), "wb").write(data)
+                open(os.path.join(self.col.media.dir(), name), "wb").write(
+                    data)
                 # update db
-                media.append((name, csum, self.col.media._mtime(os.path.join(self.col.media.dir(), name))))
+                media.append((
+                    name, csum,
+                    self.col.media._mtime(
+                        os.path.join(self.col.media.dir(), name))))
                 # remove entries from local log
-                self.col.media.db.execute("delete from log where fname = ?", name)
+                self.col.media.db.execute(
+                    "delete from log where fname = ?", name)
                 usn += 1
         # update media db and note new starting usn
         if media:
             self.col.media.db.executemany(
                 "insert or replace into media values (?,?,?)", media)
-        self.col.media.setUsn(usn) # commits
-        # if we have finished adding, we need to record the new folder mtime
-        # so that we don't trigger a needless scan
+        self.col.media.setUsn(usn)
+        # commits if we have finished adding, we need to record the
+        # new folder mtime so that we don't trigger a needless scan
         if finished:
             self.col.media.syncMod()
 
         return usn
 
     def mediaList(self):
-        """Returns a list of all the fnames in this collections media database."""
+        """
+        Return a list of the fnames in the media database.
+
+        Return a list of all the fnames in this collections media
+        database.
+        """
         fnames = []
         for fname, in self.col.media.db.execute("select fname from media"):
             fnames.append(fname)
         fnames.sort()
         return fnames
 
+
 class SyncUserSession(object):
-    def __init__(self, name, path, collection_manager, setup_new_collection=None):
-        import time
+    def __init__(
+            self, name, path, collection_manager, setup_new_collection=None):
         self.name = name
         self.path = path
         self.collection_manager = collection_manager
@@ -225,21 +257,25 @@ class SyncUserSession(object):
         return os.path.realpath(os.path.join(self.path, 'collection.anki2'))
 
     def get_thread(self):
-        return self.collection_manager.get_collection(self.get_collection_path(), self.setup_new_collection)
+        return self.collection_manager.get_collection(
+            self.get_collection_path(), self.setup_new_collection)
 
     def get_handler_for_operation(self, operation, col):
         if operation in SyncCollectionHandler.operations:
-            cache_name, handler_class = 'collection_handler', SyncCollectionHandler
+            cache_name, handler_class = 'collection_handler', \
+                SyncCollectionHandler
         else:
             cache_name, handler_class = 'media_handler', SyncMediaHandler
 
         if getattr(self, cache_name) is None:
             setattr(self, cache_name, handler_class(col))
         handler = getattr(self, cache_name)
-        # The col object may actually be new now! This happens when we close a collection
-        # for inactivity and then later re-open it (creating a new Collection object).
+        # The col object may actually be new now! This happens when we
+        # close a collection for inactivity and then later re-open it
+        # (creating a new Collection object).
         handler.col = col
         return handler
+
 
 class SimpleSessionManager(object):
     """A simple session manager that keeps the sessions in memory."""
@@ -256,35 +292,39 @@ class SimpleSessionManager(object):
     def delete(self, hkey):
         del self.sessions[hkey]
 
+
 class SimpleUserManager(object):
     """A simple user manager that always allows any user."""
 
     def authenticate(self, username, password):
         """
-        Returns True if this username is allowed to connect with this password. False otherwise.
+        Return True if username and password match.
 
-        Override this to change how users are authenticated.
+        Returns True if this username is allowed to connect with this
+        password. False otherwise.  Override this to change how users
+        are authenticated.
         """
-
         return True
 
     def username2dirname(self, username):
         """
-        Returns the directory name for the given user. By default, this is just the username.
+        Return the directory name for the given user.
 
-        Override this to adjust the mapping between users and their directory.
+        Return the directory name for the given user. By default,
+        this is just the username.  Override this to adjust the
+        mapping between users and their directory.
         """
-
         return username
 
+
 class SyncApp(object):
-    valid_urls = SyncCollectionHandler.operations + SyncMediaHandler.operations + ['hostKey', 'upload', 'download', 'getDecks']
+    valid_urls = SyncCollectionHandler.operations \
+        + SyncMediaHandler.operations \
+        + ['hostKey', 'upload', 'download', 'getDecks']
 
     def __init__(self, **kw):
-        from AnkiServer.threading import getCollectionManager
-
         self.data_root = os.path.abspath(kw.get('data_root', '.'))
-        self.base_url  = kw.get('base_url', '/')
+        self.base_url = kw.get('base_url', '/')
         self.setup_new_collection = kw.get('setup_new_collection')
         self.hook_pre_sync = kw.get('hook_pre_sync')
         self.hook_post_sync = kw.get('hook_post_sync')
@@ -313,16 +353,22 @@ class SyncApp(object):
             self.base_url = base_url + '/'
 
     def generateHostKey(self, username):
-        """Generates a new host key to be used by the given username to identify their session.
-        This values is random."""
+        """
+        Generate a new host key for a username.
 
-        import hashlib, time, random, string
+        Generate a new host key to be used by the given username to
+        identify their session.  This values is random.
+        """
         chars = string.ascii_letters + string.digits
-        val = ':'.join([username, str(int(time.time())), ''.join(random.choice(chars) for x in range(8))])
+        val = ':'.join([
+            username, str(int(time.time())),
+            ''.join(random.choice(chars) for x in range(8))])
         return hashlib.md5(val).hexdigest()
-    
+
     def create_session(self, username, user_path):
-        return SyncUserSession(username, user_path, self.collection_manager, self.setup_new_collection)
+        return SyncUserSession(
+            username, user_path, self.collection_manager,
+            self.setup_new_collection)
 
     def _decode_data(self, data, compression=0):
         import gzip
@@ -343,8 +389,9 @@ class SyncApp(object):
     def operation_upload(self, col, data, session):
         col.close()
 
-        # TODO: we should verify the database integrity before perminantly overwriting
-        # (ie. use a temporary file) and declaring this a success!
+        # TODO: we should verify the database integrity before
+        #       perminantly overwriting (ie. use a temporary file) and
+        #       declaring this a success!
         #
         # d = DB(path)
         # assert d.scalar("pragma integrity_check") == "ok"
@@ -359,7 +406,7 @@ class SyncApp(object):
         # run hook_upload if one is defined
         if self.hook_upload is not None:
             self.hook_upload(col, session)
-        
+
         return True
 
     def operation_download(self, col, session):
@@ -384,10 +431,11 @@ class SyncApp(object):
 
             if url == 'getDecks':
                 # This is an Anki 1.x client! Tell them to upgrade.
-                import zlib, logging
                 u = req.params.getone('u')
                 if u:
-                    logging.warn("'%s' is attempting to sync with an Anki 1.x client" % u)
+                    logging.warn(
+                        "'%s' is attempting to sync with an Anki 1.x client"
+                        % u)
                 return Response(
                     status='200 OK',
                     content_type='application/json',
@@ -431,7 +479,8 @@ class SyncApp(object):
                         content_type='application/json',
                         body=json.dumps(result))
                 else:
-                    # TODO: do I have to pass 'null' for the client to receive None?
+                    # TODO: do I have to pass 'null' for the client to
+                    #       receive None?
                     raise HTTPForbidden('null')
 
             # Get and verify the session
@@ -443,13 +492,15 @@ class SyncApp(object):
             if session is None:
                 raise HTTPForbidden()
 
-            if url in SyncCollectionHandler.operations + SyncMediaHandler.operations:
-                # 'meta' passes the SYNC_VER but it isn't used in the handler
+            if url in SyncCollectionHandler.operations \
+                    + SyncMediaHandler.operations:
+                # 'meta' passes the SYNC_VER but it isn't used in the
+                # handler
                 if url == 'meta':
-                    if data.has_key('v'):
+                    if 'v' in data:
                         session.version = data['v']
                         del data['v']
-                    if data.has_key('cv'):
+                    if 'cv' in data:
                         session.client_version = data['cv']
 
                 thread = session.get_thread()
@@ -459,7 +510,8 @@ class SyncApp(object):
                     if self.hook_pre_sync is not None:
                         thread.execute(self.hook_pre_sync, [session])
 
-                # Create a closure to run this operation inside of the thread allocated to this collection
+                # Create a closure to run this operation inside of the
+                # thread allocated to this collection
                 def runFunc(col):
                     handler = session.get_handler_for_operation(url, col)
                     func = getattr(handler, url)
@@ -476,9 +528,10 @@ class SyncApp(object):
                     result = json.dumps(result)
 
                 if url == 'finish':
-                    # TODO: Apparently 'finish' isn't when we're done because 'mediaList' comes
-                    #       after it... When can we possibly delete the session?
-                    #self.session_manager.delete(hkey)
+                    # TODO: Apparently 'finish' isn't when we're done
+                    #       because 'mediaList' comes after it... When
+                    #       can we possibly delete the session?
+                    #       self.session_manager.delete(hkey)
 
                     # run hook_post_sync if one is defined
                     if self.hook_post_sync is not None:
@@ -491,7 +544,8 @@ class SyncApp(object):
 
             elif url == 'upload':
                 thread = session.get_thread()
-                result = thread.execute(self.operation_upload, [data['data'], session])
+                result = thread.execute(
+                    self.operation_upload, [data['data'], session])
                 return Response(
                     status='200 OK',
                     content_type='text/plain',
@@ -508,11 +562,18 @@ class SyncApp(object):
             # This was one of our operations but it didn't get handled... Oops!
             raise HTTPInternalServerError()
 
-        return Response(status='200 OK', content_type='text/plain', body='Anki Sync Server')
+        return Response(
+            status='200 OK', content_type='text/plain',
+            body='Anki Sync Server')
+
 
 class SqliteSessionManager(SimpleSessionManager):
-    """Stores sessions in a SQLite database to prevent the user from being logged out
-    everytime the SyncApp is restarted."""
+    """
+    Store sessions in a SQLite database
+
+    Store sessions in a SQLite database to prevent the user from being
+    logged out everytime the SyncApp is restarted.
+    """
 
     def __init__(self, session_db_path):
         SimpleSessionManager.__init__(self)
@@ -524,9 +585,11 @@ class SqliteSessionManager(SimpleSessionManager):
         conn = sqlite.connect(self.session_db_path)
         if new:
             cursor = conn.cursor()
-            cursor.execute("CREATE TABLE session (hkey VARCHAR PRIMARY KEY, user VARCHAR, path VARCHAR)")
+            cursor.execute(
+                "CREATE TABLE session (hkey VARCHAR PRIMARY KEY, "
+                "user VARCHAR, path VARCHAR)")
         return conn
-    
+
     def load(self, hkey, session_factory=None):
         session = SimpleSessionManager.load(self, hkey)
         if session is not None:
@@ -535,7 +598,7 @@ class SqliteSessionManager(SimpleSessionManager):
         conn = self._conn()
         cursor = conn.cursor()
 
-        cursor.execute("SELECT user, path FROM session WHERE hkey=?", (hkey,)) 
+        cursor.execute("SELECT user, path FROM session WHERE hkey=?", (hkey,))
         res = cursor.fetchone()
 
         if res is not None:
@@ -548,7 +611,9 @@ class SqliteSessionManager(SimpleSessionManager):
         conn = self._conn()
         cursor = conn.cursor()
 
-        cursor.execute("INSERT OR REPLACE INTO session (hkey, user, path) VALUES (?, ?, ?)",
+        cursor.execute(
+            "INSERT OR REPLACE INTO session (hkey, user, path) "
+            "VALUES (?, ?, ?)",
             (hkey, session.name, session.path))
         conn.commit()
 
@@ -561,6 +626,7 @@ class SqliteSessionManager(SimpleSessionManager):
         cursor.execute("DELETE FROM session WHERE hkey=?", (hkey,))
         conn.commit()
 
+
 class SqliteUserManager(SimpleUserManager):
     """Authenticates users against a SQLite database."""
 
@@ -568,7 +634,12 @@ class SqliteUserManager(SimpleUserManager):
         self.auth_db_path = os.path.abspath(auth_db_path)
 
     def authenticate(self, username, password):
-        """Returns True if this username is allowed to connect with this password. False otherwise."""
+        """
+        Return True if username and password match.
+
+       Return True if this username is allowed to connect with this
+       password. False otherwise.
+        """
 
         conn = sqlite.connect(self.auth_db_path)
         cursor = conn.cursor()
@@ -578,29 +649,30 @@ class SqliteUserManager(SimpleUserManager):
 
         db_ret = cursor.fetchone()
 
-        if db_ret != None:
+        if db_ret is not None:
             db_hash = str(db_ret[0])
             salt = db_hash[-16:]
             hashobj = hashlib.sha256()
 
             hashobj.update(username+password+salt)
-    
+
         conn.close()
 
-        return (db_ret != None and hashobj.hexdigest()+salt == db_hash)
+        return (db_ret is not None and hashobj.hexdigest()+salt == db_hash)
+
 
 # Our entry point
 def make_app(global_conf, **local_conf):
-    if local_conf.has_key('session_db_path'):
-        local_conf['session_manager'] = SqliteSessionManager(local_conf['session_db_path'])
-    if local_conf.has_key('auth_db_path'):
-        local_conf['user_manager'] = SqliteUserManager(local_conf['auth_db_path'])
+    if 'session_db_path' in local_conf:
+        local_conf['session_manager'] = SqliteSessionManager(
+            local_conf['session_db_path'])
+    if 'auth_db_path' in local_conf:
+        local_conf['user_manager'] = SqliteUserManager(
+            local_conf['auth_db_path'])
     return SyncApp(**local_conf)
 
-def main():
-    from wsgiref.simple_server import make_server
-    from AnkiServer.threading import shutdown
 
+def main():
     ankiserver = SyncApp()
     httpd = make_server('', 8001, ankiserver)
     try:
@@ -611,5 +683,6 @@ def main():
     finally:
         shutdown()
 
-if __name__ == '__main__': main()
 
+if __name__ == '__main__':
+    main()

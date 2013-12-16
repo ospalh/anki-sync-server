@@ -1,25 +1,28 @@
-
+# -*- mode: python ; coding: utf-8 -*-
+#
 # AnkiServer - A personal Anki sync server
 # Copyright (C) 2013 David Snopek
-# 
+#
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
 # published by the Free Software Foundation, either version 3 of the
 # License, or (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Affero General Public License for more details.
-# 
+#
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from webob.dec import wsgify
-from webob.exc import *
 from webob import Response
-
-#from pprint import pprint
+from webob.dec import wsgify
+from webob.exc import HTTPBadRequest, HTTPError, HTTPForbidden, \
+    HTTPInternalServerError, HTTPMethodNotAllowed, HTTPNotFound
+import logging
+import os
+import tempfile
 
 try:
     import simplejson as json
@@ -28,24 +31,32 @@ except ImportError:
     import json
     JSONDecodeError = ValueError
 
-import os, logging
 
 import anki.consts
 import anki.lang
 from anki.lang import _ as t
 from anki.utils import intTime
 
-import AnkiServer
+from .. import __version__ as anki_server_version
+from .. import importer
+from ..find import Finder
+from ..importer import get_importer_class
+from ..threading import getCollectionManager
+from ..utils import setup_logging
+
 
 __all__ = ['RestApp', 'RestHandlerBase', 'noReturnValue']
+
 
 def noReturnValue(func):
     func.hasReturnValue = False
     return func
 
+
 class RestHandlerBase(object):
     """Parent class for a handler group."""
     hasReturnValue = True
+
 
 class _RestHandlerWrapper(RestHandlerBase):
     """Wrapper for functions that we can't modify."""
@@ -53,10 +64,13 @@ class _RestHandlerWrapper(RestHandlerBase):
         self.func_name = func_name
         self.func = func
         self.hasReturnValue = hasReturnValue
+
     def __call__(self, *args, **kw):
         return self.func(*args, **kw)
 
+
 class RestHandlerRequest(object):
+
     def __init__(self, app, data, ids, session):
         self.app = app
         self.data = data
@@ -64,24 +78,31 @@ class RestHandlerRequest(object):
         self.session = session
 
     def copy(self):
-        return RestHandlerRequest(self.app, self.data.copy(), self.ids[:], self.session)
+        return RestHandlerRequest(
+            self.app, self.data.copy(), self.ids[:], self.session)
 
     def __eq__(self, other):
-        return self.app == other.app and self.data == other.data and self.ids == other.ids and self.session == other.session
+        return self.app == other.app and self.data == other.data \
+            and self.ids == other.ids and self.session == other.session
+
 
 class RestApp(object):
-    """A WSGI app that implements RESTful operations on Collections, Decks and Cards."""
+    """
+    A WSGI app that implements RESTful operations on Collections,
+    Decks and Cards.
+    """
 
-    # Defines not only the valid handler types, but their position in the URL string
+    # Defines not only the valid handler types, but their position in
+    # the URL string
     handler_types = ['collection', ['model', 'note', 'deck', 'card']]
 
     def __init__(self, data_root, **kw):
-        from AnkiServer.threading import getCollectionManager
 
         self.data_root = os.path.abspath(data_root)
         self.allowed_hosts = kw.get('allowed_hosts', '*')
         self.setup_new_collection = kw.get('setup_new_collection')
-        # TODO: implement! The idea is that these will run before/after executing any handler
+        # TODO: implement! The idea is that these will run
+        # before/after executing any handler
         #self.hook_pre_execute = kw.get('hook_pre_execute')
         #self.hook_post_execute = kw.get('hook_post_execute')
 
@@ -107,47 +128,73 @@ class RestApp(object):
         # hold per collection session data
         self.sessions = {}
 
-    def add_handler(self, type, name, handler):
-        """Adds a callback handler for a type (collection, deck, card) with a unique name.
-        
-         - 'type' is the item that will be worked on, for example: collection, deck, and card.
+    def add_handler(self, type_, name, handler):
+        """
+        Add a callback handler for a type (collection, deck, card).
+
+        Add a callback handler for a type (collection, deck, card)
+        with a unique name.
+
+         - 'type_' is the item that will be worked on, for example:
+           collection, deck, and card.
 
          - 'name' is a unique name for the handler that gets used in the URL.
 
          - 'handler' is a callable that takes (collection, data, ids).
         """
 
-        if self.handlers[type].has_key(name):
+        if name in self.handlers[type_]:
             raise "Handler already for %(type)s/%(name)s exists!"
-        self.handlers[type][name] = handler
+        self.handlers[type_][name] = handler
 
-    def add_handler_group(self, type, group):
-        """Adds several handlers for every public method on an object descended from RestHandlerBase.
-        
-        This allows you to create a single class with several methods, so that you can quickly
-        create a group of related handlers."""
+    def add_handler_group(self, type_, group):
+        """
+        Adds several handlers
+
+        Add several handlers for every public method on an object
+        descended from RestHandlerBase.
+
+        This allows you to create a single class with several methods,
+        so that you can quickly create a group of related handlers.
+        """
 
         import inspect
-        for name, method in inspect.getmembers(group, predicate=inspect.ismethod):
+        for name, method in inspect.getmembers(
+                group, predicate=inspect.ismethod):
             if not name.startswith('_'):
-                if hasattr(group, 'hasReturnValue') and not hasattr(method, 'hasReturnValue'):
-                    method = _RestHandlerWrapper(group.__class__.__name__ + '.' + name, method, group.hasReturnValue)
-                self.add_handler(type, name, method)
+                if hasattr(group, 'hasReturnValue') \
+                        and not hasattr(method, 'hasReturnValue'):
+                    method = _RestHandlerWrapper(
+                        group.__class__.__name__ + '.' + name,
+                        method, group.hasReturnValue)
+                self.add_handler(type_, name, method)
 
-    def execute_handler(self, type, name, col, req):
-        """Executes the handler with the given type and name, passing in the col and req as arguments."""
+    def execute_handler(self, type_, name, col, req):
+        """
+        Execute the handler with the given type and name
 
-        handler, hasReturnValue = self._getHandler(type, name)
+        Execute the handler with the given type and name, passing in
+        the col and req as arguments.
+        """
+
+        handler, hasReturnValue = self._getHandler(type_, name)
         ret = handler(col, req)
         if hasReturnValue:
             return ret
 
     def list_collections(self):
-        """Returns an array of valid collection names in our self.data_path."""
-        return [x for x in os.listdir(self.data_root) if os.path.exists(os.path.join(self.data_root, x, 'collection.anki2'))]
+        """Return an array of valid collection names in our self.data_path."""
+        return [x for x in os.listdir(self.data_root)
+                if os.path.exists(
+                os.path.join(self.data_root, x, 'collection.anki2'))]
 
     def _checkRequest(self, req):
-        """Raises an exception if the request isn't allowed or valid for some reason."""
+        """
+        Raise an exception if the request isn't allowed or valid
+
+        Raise an exception if the request isn't allowed or valid for
+        some reason.
+        """
         if self.allowed_hosts != '*':
             try:
                 remote_addr = req.headers['X-Forwarded-For']
@@ -155,7 +202,7 @@ class RestApp(object):
                 remote_addr = req.remote_addr
             if remote_addr != self.allowed_hosts:
                 raise HTTPForbidden()
-        
+
         if req.path == '/':
             if req.method != 'GET':
                 raise HTTPMethodNotAllowed(allow=['GET'])
@@ -163,10 +210,14 @@ class RestApp(object):
             raise HTTPMethodNotAllowed(allow=['POST'])
 
     def _parsePath(self, path):
-        """Takes a request path and returns a tuple containing the handler type, name
-        and a list of ids.
+        """
+        Take a request path and returns a tuple.
 
-        Raises an HTTPNotFound exception if the path is invalid."""
+        Take a request path and returns a tuple containing the handler
+        type, name and a list of ids.
+
+        Raises an HTTPNotFound exception if the path is invalid.
+        """
 
         if path in ('', '/'):
             raise HTTPNotFound()
@@ -212,29 +263,39 @@ class RestApp(object):
         return (handler_type, name, ids)
 
     def _getCollectionPath(self, collection_id):
-        """Returns the path to the collection based on the collection_id from the request.
-        
+        """
+        Return the path to the collection
+
+        Return the path to the collection based on the collection_id
+        from the request.
+
         Raises HTTPBadRequest if the collection_id is invalid."""
 
-        path = os.path.normpath(os.path.join(self.data_root, collection_id, 'collection.anki2'))
+        path = os.path.normpath(
+            os.path.join(self.data_root, collection_id, 'collection.anki2'))
         if path[0:len(self.data_root)] != self.data_root:
             # attempting to escape our data jail!
-            raise HTTPBadRequest('"%s" is not a valid collection' % collection_id)
+            raise HTTPBadRequest(
+                '"%s" is not a valid collection' % collection_id)
 
         return path
 
     def _getHandler(self, type, name):
-        """Returns a tuple containing handler function for this type and name, and a boolean flag
-        if that handler has a return value.
+        """
+        Return a tuple containing handler function and other info.
 
-        Raises an HTTPNotFound exception if the handler doesn't exist."""
+        Return a tuple containing handler function for this type and
+        name, and a boolean flag if that handler has a return value.
+
+        Raises an HTTPNotFound exception if the handler doesn't exist.
+        """
 
         # get the handler function
         try:
             handler = self.handlers[type][name]
         except KeyError:
             raise HTTPNotFound()
-         
+
         # get if we have a return value
         hasReturnValue = True
         if hasattr(handler, 'hasReturnValue'):
@@ -243,14 +304,17 @@ class RestApp(object):
         return (handler, hasReturnValue)
 
     def _parseRequestBody(self, req):
-        """Parses the request body (JSON) into a Python dict and returns it.
+        """
+        Parse the request body (JSON) into a Python dict and return it.
 
-        Raises an HTTPBadRequest exception if the request isn't valid JSON."""
-        
+        Raises an HTTPBadRequest exception if the request isn't valid JSON.
+        """
+
         try:
             data = json.loads(req.body)
         except JSONDecodeError, e:
-            logging.error(req.path+': Unable to parse JSON: '+str(e), exc_info=True)
+            logging.error(req.path + ': Unable to parse JSON: ' +
+                          str(e), exc_info=True)
             raise HTTPBadRequest()
 
         # fix for a JSON encoding 'quirk' in PHP
@@ -269,9 +333,13 @@ class RestApp(object):
 
         # special non-collection paths
         if req.path == '/':
-            return Response('AnkiServer ' + str(AnkiServer.__version__), content_type='text/plain')
+            return Response(
+                'AnkiServer ' + anki_server_version,
+                content_type='text/plain')
         if req.path == '/list_collections':
-            return Response(json.dumps(self.list_collections()), content_type='application/json')
+            return Response(
+                json.dumps(self.list_collections()),
+                content_type='application/json')
 
         # parse the path
         type, name, ids = self._parsePath(req.path)
@@ -298,9 +366,11 @@ class RestApp(object):
 
         # run it!
         try:
-            col = self.collection_manager.get_collection(collection_path, self.setup_new_collection)
+            col = self.collection_manager.get_collection(
+                collection_path, self.setup_new_collection)
             handler_request = RestHandlerRequest(self, data, ids, session)
-            output = col.execute(handler, [handler_request], {}, hasReturnValue)
+            output = col.execute(
+                handler, [handler_request], {}, hasReturnValue)
         except HTTPError, e:
             # we pass these on through!
             raise
@@ -311,11 +381,13 @@ class RestApp(object):
         if output is None:
             return Response('', content_type='text/plain')
         else:
-            return Response(json.dumps(output), content_type='application/json')
+            return Response(
+                json.dumps(output), content_type='application/json')
+
 
 class CollectionHandler(RestHandlerBase):
     """Default handler group for 'collection' type."""
-    
+
     #
     # MODELS - Store fields definitions and templates for notes
     #
@@ -346,9 +418,9 @@ class CollectionHandler(RestHandlerBase):
 
     def latest_notes(self, col, req):
         # TODO: use SQLAlchemy objects to do this
-        sql = "SELECT n.id FROM notes AS n";
+        sql = "SELECT n.id FROM notes AS n"
         args = []
-        if req.data.has_key('updated_since'):
+        if 'updated_since' in req.data:
             sql += ' WHERE n.mod > ?'
             args.append(req.data['updated_since'])
         sql += ' ORDER BY n.mod DESC'
@@ -377,7 +449,7 @@ class CollectionHandler(RestHandlerBase):
         for name, value in req.data['fields'].items():
             note[name] = value
 
-        if req.data.has_key('tags'):
+        if 'tag' in req.data:
             note.setTagsFromStr(req.data['tags'])
 
         col.addNote(note)
@@ -390,7 +462,8 @@ class CollectionHandler(RestHandlerBase):
     #
 
     def list_decks(self, col, req):
-        # This is already a list of dicts, so it doesn't need to be serialized
+        # This is already a list of dicts, so it doesn't need to be
+        # serialized
         return col.decks.all()
 
     @noReturnValue
@@ -409,8 +482,10 @@ class CollectionHandler(RestHandlerBase):
         deck = col.decks.byName(name)
         if deck:
             if not deck['dyn']:
-                raise HTTPBadRequest("There is an existing non-dynamic deck with the name %s" % name)
-            
+                raise HTTPBadRequest(
+                    "There is an existing non-dynamic deck with the name %s"
+                    % name)
+
             # safe to empty it because it's a dynamic deck
             # TODO: maybe this should be an option?
             col.sched.emptyDyn(deck['id'])
@@ -419,7 +494,7 @@ class CollectionHandler(RestHandlerBase):
 
         query = req.data.get('query', '')
         count = int(req.data.get('count', 100))
-        mode = req.data.get('mode', 'random') 
+        mode = req.data.get('mode', 'random')
 
         try:
             mode = self.dyn_modes[mode]
@@ -446,32 +521,33 @@ class CollectionHandler(RestHandlerBase):
         deck = col.decks.byName(name)
 
         if not deck:
-            raise HTTPBadRequest("Cannot find a deck with the given name: %s" % name)
+            raise HTTPBadRequest(
+                "Cannot find a deck with the given name: %s" % name)
 
         if not deck['dyn']:
             raise HTTPBadRequest("The given deck is not dynamic: %s" % name)
-            
+
         col.sched.emptyDyn(deck['id'])
 
     #
-    # CARD - A specific card in a deck with a history of review (generated from
-    #        a note based on the template).
+    # CARD - A specific card in a deck with a history of review
+    #        (generated from a note based on the template).
     #
 
     def find_cards(self, col, req):
-        from AnkiServer.find import Finder
-
         query = req.data.get('query', '')
         order = req.data.get('order', False)
 
-        # TODO: patch Anki to support limit/offset and then remove this crazy hack!
+        # TODO: patch Anki to support limit/offset and then remove
+        #       this crazy hack!
         finder = Finder(col)
         finder.limit = int(req.data.get('limit', 0))
         finder.offset = int(req.data.get('offset', 0))
         ids = finder.findCards(query, order)
 
         if req.data.get('preload', False):
-            cards = [CardHandler._serialize(col.getCard(id), req.data) for id in ids]
+            cards = [CardHandler._serialize(col.getCard(id), req.data)
+                     for id in ids]
         else:
             cards = [{'id': id} for id in ids]
 
@@ -479,9 +555,10 @@ class CollectionHandler(RestHandlerBase):
 
     def latest_cards(self, col, req):
         # TODO: use SQLAlchemy objects to do this
-        sql = "SELECT c.id FROM notes AS n INNER JOIN cards AS c ON c.nid = n.id";
+        sql = "SELECT c.id FROM notes AS n INNER " \
+            "JOIN cards AS c ON c.nid = n.id"
         args = []
-        if req.data.has_key('updated_since'):
+        if 'updated_since' in req.data:
             sql += ' WHERE n.mod > ?'
             args.append(req.data['updated_since'])
         sql += ' ORDER BY n.mod DESC'
@@ -489,18 +566,20 @@ class CollectionHandler(RestHandlerBase):
         ids = col.db.list(sql, *args)
 
         if req.data.get('preload', False):
-            cards = [CardHandler._serialize(col.getCard(id), req.data) for id in ids]
+            cards = [CardHandler._serialize(col.getCard(id), req.data)
+                     for id in ids]
         else:
             cards = [{'id': id} for id in ids]
 
         return cards
 
     #
-    # SCHEDULER - Controls card review, ie. intervals, what cards are due, answering a card, etc.
+    # SCHEDULER - Controls card review, ie. intervals, what cards are
+    #             due, answering a card, etc.
     #
 
     def reset_scheduler(self, col, req):
-        if req.data.has_key('deck'):
+        if 'deck' in req.data:
             deck = DeckHandler._get_deck(col, req.data['deck'])
             col.decks.select(deck['id'])
 
@@ -530,17 +609,18 @@ class CollectionHandler(RestHandlerBase):
         l.append('Again')
         l.reverse()
 
-        # Loop through and add the ease, estimated time (in seconds) and other info
+        # Loop through and add the ease, estimated time (in seconds)
+        # and other info
         return [{
-          'ease': ease,
-          'label': label,
-          'string_label': t(label),
-          'interval': col.sched.nextIvl(card, ease),
-          'string_interval': col.sched.nextIvlStr(card, ease),
+            'ease': ease,
+            'label': label,
+            'string_label': t(label),
+            'interval': col.sched.nextIvl(card, ease),
+            'string_interval': col.sched.nextIvlStr(card, ease),
         } for ease, label in enumerate(l, 1)]
 
     def next_card(self, col, req):
-        if req.data.has_key('deck'):
+        if 'deck' in req.data:
             deck = DeckHandler._get_deck(col, req.data['deck'])
             col.decks.select(deck['id'])
 
@@ -550,6 +630,7 @@ class CollectionHandler(RestHandlerBase):
 
         # put it into the card cache to be removed when we answer it
         #if not req.session.has_key('cards'):
+        #or rather if not 'cards' in req.session:
         #    req.session['cards'] = {}
         #req.session['cards'][long(card.id)] = card
 
@@ -560,10 +641,11 @@ class CollectionHandler(RestHandlerBase):
 
         return result
 
-    # TODO: calling answer_card() when the scheduler is not setup can 
-    #       be an error! This can happen after a collection has been closed
-    #       for inactivity, and opened later. But since we're using
-    #       @noReturnValue, no error will be passed up. :-/ What to do?
+    # TODO: calling answer_card() when the scheduler is not setup can
+    #       be an error! This can happen after a collection has been
+    #       closed for inactivity, and opened later. But since we're
+    #       using @noReturnValue, no error will be passed up. :-/ What
+    #       to do?
     @noReturnValue
     def answer_card(self, col, req):
         import time
@@ -572,7 +654,7 @@ class CollectionHandler(RestHandlerBase):
         ease = int(req.data['ease'])
 
         card = col.getCard(card_id)
-        if req.data.has_key('timerStarted'):
+        if 'timerStarted' in req.data:
             card.timerStarted = float(req.data['timerStarted'])
         else:
             card.timerStarted = time.time()
@@ -593,16 +675,21 @@ class CollectionHandler(RestHandlerBase):
         """Returns the most recent ease for each card."""
 
         # TODO: Use sqlalchemy to build this query!
-        sql = "SELECT r.cid, r.ease, r.id FROM revlog AS r INNER JOIN (SELECT cid, MAX(id) AS id FROM revlog GROUP BY cid) AS q ON r.cid = q.cid AND r.id = q.id"
+        sql = """\
+SELECT r.cid, r.ease, r.id FROM revlog AS r INNER
+JOIN (SELECT cid, MAX(id) AS id FROM revlog GROUP BY cid) AS q
+ON r.cid = q.cid AND r.id = q.id"""
         where = []
-        if req.data.has_key('ids'):
-            where.append('ids IN (' + (','.join(["'%s'" % x for x in req.data['ids']])) + ')')
+        if 'ids' in req.data:
+            where.append('ids IN (' + (','.join(
+                ["'%s'" % x for x in req.data['ids']])) + ')')
         if len(where) > 0:
             sql += ' WHERE ' + ' AND '.join(where)
 
         result = []
         for r in col.db.all(sql):
-            result.append({'id': r[0], 'ease': r[1], 'timestamp': int(r[2] / 1000)})
+            result.append(
+                {'id': r[0], 'ease': r[1], 'timestamp': int(r[2] / 1000)})
 
         return result
 
@@ -610,9 +697,10 @@ class CollectionHandler(RestHandlerBase):
         """Returns recent entries from the revlog."""
 
         # TODO: Use sqlalchemy to build this query!
-        sql = "SELECT r.id, r.ease, r.cid, r.usn, r.ivl, r.lastIvl, r.factor, r.time, r.type FROM revlog AS r"
+        sql = "SELECT r.id, r.ease, r.cid, r.usn, r.ivl, r.lastIvl, " \
+            "r.factor, r.time, r.type FROM revlog AS r"
         args = []
-        if req.data.has_key('updated_since'):
+        if 'updated_since' in req.data:
             sql += ' WHERE r.id > ?'
             args.append(long(req.data['updated_since']) * 1000)
         sql += ' ORDER BY r.id DESC'
@@ -633,16 +721,16 @@ class CollectionHandler(RestHandlerBase):
         } for r in revlog]
 
     stats_reports = {
-      'today': 'todayStats',
-      'due': 'dueGraph',
-      'reps': 'repsGraph',
-      'interval': 'ivlGraph',
-      'hourly': 'hourGraph',
-      'ease': 'easeGraph',
-      'card': 'cardGraph',
-      'footer': 'footer',
-    }
-    stats_reports_order = ['today', 'due', 'reps', 'interval', 'hourly', 'ease', 'card', 'footer']
+        'today': 'todayStats',
+        'due': 'dueGraph',
+        'reps': 'repsGraph',
+        'interval': 'ivlGraph',
+        'hourly': 'hourGraph',
+        'ease': 'easeGraph',
+        'card': 'cardGraph',
+        'footer': 'footer'}
+    stats_reports_order = [
+        'today', 'due', 'reps', 'interval', 'hourly', 'ease', 'card', 'footer']
 
     def stats_report(self, col, req):
         import anki.stats
@@ -663,7 +751,7 @@ class CollectionHandler(RestHandlerBase):
             html = ''
 
         for name in reports:
-            if not self.stats_reports.has_key(name):
+            if not name in self.stats_reports:
                 raise HTTPBadRequest("Unknown report name: %s" % name)
             func = getattr(stats, self.stats_reports[name])
 
@@ -673,8 +761,12 @@ class CollectionHandler(RestHandlerBase):
 
         # fix an error in some inline styles
         # TODO: submit a patch to Anki!
-        html = re.sub(r'style="width:([0-9\.]+); height:([0-9\.]+);"', r'style="width:\1px; height: \2px;"', html)
-        html = re.sub(r'-webkit-transform: ([^;]+);', r'-webkit-transform: \1; -moz-transform: \1; -ms-transform: \1; -o-transform: \1; transform: \1;', html)
+        html = re.sub(r'style="width:([0-9\.]+); height:([0-9\.]+);"',
+                      r'style="width:\1px; height: \2px;"', html)
+        html = re.sub(
+            r'-webkit-transform: ([^;]+);',
+            r'-webkit-transform: \1; -moz-transform: \1; '
+            r'-ms-transform: \1; -o-transform: \1; transform: \1;', html)
 
         scripts = []
         if include_jquery or include_flot:
@@ -696,13 +788,19 @@ class CollectionHandler(RestHandlerBase):
     def set_language(self, col, req):
         anki.lang.setLang(req.data['code'])
 
+
 class ImportExportHandler(RestHandlerBase):
-    """Handler group for the 'collection' type, but it's not added by default."""
+    """
+    Handler group for the 'collection' type
+
+    Handler group for the 'collection' type, but it's not added by
+    default.
+    """
 
     def _get_filedata(self, data):
         import urllib2
 
-        if data.has_key('data'):
+        if 'data' in data:
             return data['data']
 
         fd = None
@@ -717,8 +815,6 @@ class ImportExportHandler(RestHandlerBase):
 
     def _get_importer_class(self, data):
         filetype = data['filetype']
-
-        from AnkiServer.importer import get_importer_class
         importer_class = get_importer_class(filetype)
         if importer_class is None:
             raise HTTPBadRequest("Unknown filetype '%s'" % filetype)
@@ -726,9 +822,6 @@ class ImportExportHandler(RestHandlerBase):
         return importer_class
 
     def import_file(self, col, req):
-        import AnkiServer.importer
-        import tempfile
-
         # get the importer class
         importer_class = self._get_importer_class(req.data)
 
@@ -742,10 +835,11 @@ class ImportExportHandler(RestHandlerBase):
                 path = fd.name
                 fd.write(filedata)
 
-            AnkiServer.importer.import_file(importer_class, col, path)
+            importer.import_file(importer_class, col, path)
         finally:
             if path is not None:
                 os.unlink(path)
+
 
 class ModelHandler(RestHandlerBase):
     """Default handler group for 'model' type."""
@@ -755,6 +849,7 @@ class ModelHandler(RestHandlerBase):
         if model is None:
             raise HTTPNotFound()
         return col.models.fieldNames(model)
+
 
 class NoteHandler(RestHandlerBase):
     """Default handler group for 'note' type."""
@@ -842,6 +937,7 @@ class NoteHandler(RestHandlerBase):
 
         note.flush(mod)
 
+
 class DeckHandler(RestHandlerBase):
     """Default handler group for 'deck' type."""
 
@@ -860,14 +956,15 @@ class DeckHandler(RestHandlerBase):
 
     def index(self, col, req):
         return self._get_deck(col, req.ids[1])
-    
+
     def next_card(self, col, req):
         req_copy = req.copy()
         req_copy.data['deck'] = req.ids[1]
         del req_copy.ids[1]
 
         # forward this to the CollectionHandler
-        return req.app.execute_handler('collection', 'next_card', col, req_copy)
+        return req.app.execute_handler(
+            'collection', 'next_card', col, req_copy)
 
     def get_conf(self, col, req):
         # TODO: should probably live in a ConfHandler
@@ -883,6 +980,7 @@ class DeckHandler(RestHandlerBase):
         conf.update(data)
 
         col.decks.updateConf(conf)
+
 
 class CardHandler(RestHandlerBase):
     """Default handler group for 'card' type."""
@@ -926,7 +1024,9 @@ class CardHandler(RestHandlerBase):
 
     @staticmethod
     def _latest_revlog(col, card_id):
-        r = col.db.first("SELECT r.id, r.ease FROM revlog AS r WHERE r.cid = ? ORDER BY id DESC LIMIT 1", card_id)
+        r = col.db.first(
+            "SELECT r.id, r.ease FROM revlog AS r WHERE r.cid = ? "
+            "ORDER BY id DESC LIMIT 1", card_id)
         if r:
             return {'id': r[0], 'ease': r[1], 'timestamp': int(r[0] / 1000)}
 
@@ -957,16 +1057,15 @@ class CardHandler(RestHandlerBase):
     def latest_revlog(self, col, req):
         return self._latest_revlog(col, req.ids[1])
 
+
 # Our entry point
 def make_app(global_conf, **local_conf):
     # TODO: we should setup the default language from conf!
 
     # setup the logger
-    from AnkiServer.utils import setup_logging
     setup_logging(local_conf.get('logging.config_file'))
 
     return RestApp(
         data_root=local_conf.get('data_root', '.'),
         allowed_hosts=local_conf.get('allowed_hosts', '*')
     )
-
